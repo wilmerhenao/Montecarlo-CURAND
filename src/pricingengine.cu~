@@ -1,0 +1,665 @@
+/*
+ * Copyright 1993-2010 NVIDIA Corporation.  All rights reserved.
+ *
+ * Please refer to the NVIDIA end user license agreement (EULA) associated
+ * with this source code for terms and conditions that govern your use of
+ * this software. Any use, reproduction, disclosure, or distribution of
+ * this software and related documentation outside the terms of the EULA
+ * is strictly prohibited.
+ *
+ */
+
+#include "../inc/pricingengine.h"
+#include <stdio.h>
+#include <string>
+#include <vector>
+#include <numeric>
+#include <stdexcept>
+#include <typeinfo>
+#include <cuda_runtime_api.h>
+#include <curand_kernel.h>
+#include <shrUtils.h>
+
+#include "../inc/genericoption.h"
+#include "../../inc/cudasharedmem.h"
+
+using std::string;
+using std::vector;
+
+// RNG init kernel
+__global__ void initRNG(curandState * const rngStates,
+                        const unsigned int seed)
+{
+    // Determine thread ID
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Initialise the RNG
+    curand_init(seed, tid, 0, &rngStates[tid]);
+}
+
+__device__ inline float getPathStep(float &drift, float &diffusion, curandState &state)
+{
+    return expf(drift + diffusion * curand_normal(&state));
+}
+__device__ inline double getPathStep(double &drift, double &diffusion, curandState &state)
+{
+    return exp(drift + diffusion * curand_normal_double(&state));
+}
+
+// Path generation kernel
+template <typename Real>
+__global__ void generatePaths(Real * const paths,
+                              curandState * const rngStates,
+                              const genericOption<Real> * const option,
+                              const unsigned int numSims,
+                              const unsigned int numTimesteps)
+{
+    // Determine thread ID
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int step = gridDim.x * blockDim.x;
+
+    // Compute parameters
+    Real drift     = (option->r - static_cast<Real>(0.5) * option->sigma * option->sigma) * option->dt;
+    Real diffusion = option->sigma * sqrt(option->dt);
+
+    // Initialise the RNG
+    curandState localState = rngStates[tid];
+
+    for (unsigned int i = tid ; i < numSims ; i += step)
+    {
+        // Shift the output pointer
+        Real *output = paths + i;
+        
+        // Simulate the path
+        Real s = static_cast<Real>(1);
+        for (unsigned int t = 0 ; t < numTimesteps ; t++, output += numSims)
+        {
+            s *= getPathStep(drift, diffusion, localState);
+            *output = s;
+        }
+    }
+}
+
+template <typename Real>
+__device__ Real reduce_sum(Real in)
+{
+    SharedMemory<Real> sdata;
+
+    // Perform first level of reduction:
+    // - Write to shared memory
+    unsigned int ltid = threadIdx.x;
+
+    sdata[ltid] = in;
+    __syncthreads();
+
+    // Do reduction in shared mem
+    for (unsigned int s = blockDim.x / 2 ; s > 0 ; s >>= 1) 
+    {
+        if (ltid < s) 
+        {
+            sdata[ltid] += sdata[ltid + s];
+        }
+        __syncthreads();
+    }
+
+    return sdata[0];
+}
+
+// Asian Valuation kernel
+template <typename Real>
+__global__ void computeValueAsian(Real * const values,
+                             const Real * const paths,
+                             const genericOption<Real> * const option,
+                             const unsigned int numSims,
+                             const unsigned int numTimesteps)
+{
+    // Determine thread ID
+    unsigned int bid = blockIdx.x;
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int step = gridDim.x * blockDim.x;
+
+    Real sumPayoffs = static_cast<Real>(0);
+    for (unsigned int i = tid ; i < numSims ; i += step)
+    {
+        // Shift the input pointer
+        const Real *path = paths + i;
+        // Compute the arithmetic average
+        Real avg = static_cast<Real>(0);
+        for (unsigned int t = 0 ; t < numTimesteps ; t++, path += numSims)
+        {
+            avg += *path;
+        }
+        avg = avg * option->spot / numTimesteps;
+        // Compute the payoff
+        Real payoff = avg - option->strike;
+        if (option->type == genericOption<Real>::Put)
+        {
+            payoff = - payoff;
+        }
+        payoff = max(static_cast<Real>(0), payoff);
+        // Accumulate payoff locally
+        sumPayoffs += payoff;
+    }
+
+    // Reduce within the block
+    sumPayoffs = reduce_sum<Real>(sumPayoffs);
+
+    // Store the result
+    if (threadIdx.x == 0)
+        values[bid] = sumPayoffs;
+}
+
+// Plain Vanilla Valuation kernel
+template <typename Real>
+__global__ void computeValuePlainVanilla(Real * const values,
+                             const Real * const paths,
+                             const genericOption<Real> * const option,
+                             const unsigned int numSims,
+                             const unsigned int numTimesteps)
+{
+    // Determine thread ID
+    unsigned int bid = blockIdx.x;
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int step = gridDim.x * blockDim.x;
+
+    Real sumPayoffs = static_cast<Real>(0);
+    for (unsigned int i = tid ; i < numSims ; i += step)
+    {
+        // Shift the input pointer
+        const Real *path = paths + i;
+        // Compute the arithmetic average
+        Real finval = static_cast<Real>(0);
+        for (unsigned int t = 0 ; t < numTimesteps ; t++, path += numSims)
+        {
+            finval = *path;
+        }
+        finval = finval * option->spot;
+        // Compute the payoff
+        Real payoff = finval - option->strike;
+        if (option->type == genericOption<Real>::Put)
+        {
+            payoff = - payoff;
+        }
+        payoff = max(static_cast<Real>(0), payoff);
+        // Accumulate payoff locally
+        sumPayoffs += payoff;
+    }
+
+    // Reduce within the block
+    sumPayoffs = reduce_sum<Real>(sumPayoffs);
+
+    // Store the result
+    if (threadIdx.x == 0)
+        values[bid] = sumPayoffs;
+}
+
+// Lookback Valuation kernel
+template <typename Real>
+__global__ void computeValueLookback(Real * const values,
+                             const Real * const paths,
+                             const genericOption<Real> * const option,
+                             const unsigned int numSims,
+                             const unsigned int numTimesteps)
+{
+    // Determine thread ID
+    unsigned int bid = blockIdx.x;
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int step = gridDim.x * blockDim.x;
+
+    Real sumPayoffs = static_cast<Real>(0);
+    for (unsigned int i = tid ; i < numSims ; i += step)
+    {
+        // Shift the input pointer
+        const Real *path = paths + i;
+        // Compute the arithmetic average
+        Real finval = static_cast<Real>(0);
+	Real valmin = static_cast<Real>(1);
+        for (unsigned int t = 0 ; t < numTimesteps ; t++, path += numSims)
+        {
+            finval = *path;
+	    if(valmin > finval)
+	      valmin = finval;
+        }
+        finval = finval * option->spot;
+        // Compute the payoff
+        Real payoff = finval - valmin * option->spot;
+        payoff = max(static_cast<Real>(0), payoff);
+        // Accumulate payoff locally
+        sumPayoffs += payoff;
+    }
+
+    // Reduce within the block
+    sumPayoffs = reduce_sum<Real>(sumPayoffs);
+
+    // Store the result
+    if (threadIdx.x == 0)
+        values[bid] = sumPayoffs;
+}
+
+// Plain Knock-out & Knock-in Valuation kernel
+template <typename Real>
+__global__ void computeValueKnockoutin(Real * const valuesko,
+				       Real * const valueski,
+				       const Real * const paths,
+				       const genericOption<Real> * const option,
+				       const unsigned int numSims,
+                                       const unsigned int numTimesteps){
+    // Determine thread ID
+    unsigned int bid = blockIdx.x;
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int step = gridDim.x * blockDim.x;
+    Real killer;
+    Real sumPayoffsknockout = static_cast<Real>(0);
+    Real sumPayoffsknockin = static_cast<Real>(0);
+    for (unsigned int i = tid ; i < numSims ; i += step)
+    {
+        // Shift the input pointer
+        const Real *path = paths + i;
+        // Compute the arithmetic average
+        Real finval = static_cast<Real>(0), finvalknockout = static_cast<Real>(0), finvalknockin = static_cast<Real>(0);
+	killer = static_cast<Real>(1);
+        for (unsigned int t = 0 ; t < numTimesteps ; t++, path += numSims)
+        {
+            finval = *path;
+            if(finval * option->spot > option->barrier)
+	      killer = static_cast<Real>(0);
+        }
+        finvalknockout = finval * option->spot * killer;
+	finvalknockin = finval * option->spot * (static_cast<Real>(1) - killer);
+        // Compute the payoff
+        Real payoffknockout = finvalknockout - option->strike;
+	Real payoffknockin = finvalknockin - option->strike;
+        if (option->type == genericOption<Real>::Put)
+        {
+            payoffknockout = - payoffknockout;
+	    payoffknockin = -payoffknockin;
+        }
+        payoffknockout = max(static_cast<Real>(0), payoffknockout);
+        payoffknockin = max(static_cast<Real>(0), payoffknockin);
+        // Accumulate payoff locally
+        sumPayoffsknockout += payoffknockout;
+        sumPayoffsknockin += payoffknockin;
+    }
+
+    // Reduce within the block
+    sumPayoffsknockout = reduce_sum<Real>(sumPayoffsknockout);
+    sumPayoffsknockin = reduce_sum<Real>(sumPayoffsknockin);
+
+    // Store the result
+    if (threadIdx.x == 0){
+        valuesko[bid] = sumPayoffsknockout;
+        valueski[bid] = sumPayoffsknockin;
+    }
+}
+
+template <typename Real>
+PricingEngine<Real>::PricingEngine(unsigned int numSims, unsigned int device, unsigned int threadBlockSize, unsigned int seed)
+    : m_numSims(numSims),
+    m_device(device),
+    m_threadBlockSize(threadBlockSize),
+    m_seed(seed)
+{
+}
+
+template <typename Real>
+void PricingEngine<Real>::operator()(genericOption<Real> &option)
+{
+    cudaError_t cudaResult = cudaSuccess;
+    struct cudaDeviceProp     deviceProperties;
+    struct cudaFuncAttributes funcAttributes;
+    
+    // Get device properties
+    cudaResult = cudaGetDeviceProperties(&deviceProperties, m_device);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not get device properties: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+
+    // Check precision is valid
+    unsigned int deviceVersion = deviceProperties.major * 10 + deviceProperties.minor;
+    if (typeid(Real) == typeid(double) && deviceVersion < 13)
+    {
+        throw std::runtime_error("Device does not have double precision support");
+    }
+    
+    // Attach to GPU
+    cudaResult = cudaSetDevice(m_device);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not set CUDA device: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+
+    // Determine how to divide the work between cores
+    dim3 block;
+    dim3 grid;
+    block.x = m_threadBlockSize;
+    grid.x  = (m_numSims + m_threadBlockSize - 1) / m_threadBlockSize;
+    
+    // Aim to launch around ten or more times as many blocks as there
+    // are multiprocessors on the target device.
+    unsigned int blocksPerSM = 10;
+    unsigned int numSMs      = deviceProperties.multiProcessorCount;
+    while (grid.x > 2 * blocksPerSM * numSMs)
+        grid.x >>= 1;
+
+    // Get initRNG function properties and check the maximum block size
+    cudaResult = cudaFuncGetAttributes(&funcAttributes, initRNG);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not get function attributes: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    if (block.x > (unsigned int)funcAttributes.maxThreadsPerBlock)
+    {
+        throw std::runtime_error("Block X dimension is too large for initRNG kernel");
+    }
+
+    // Get generatePaths function properties and check the maximum block size
+    cudaResult = cudaFuncGetAttributes(&funcAttributes, generatePaths<Real>);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not get function attributes: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    if (block.x > (unsigned int)funcAttributes.maxThreadsPerBlock)
+    {
+        throw std::runtime_error("Block X dimension is too large for generatePaths kernel");
+    }
+
+    // Get computeValueAsian function properties and check the maximum block size
+    cudaResult = cudaFuncGetAttributes(&funcAttributes, computeValueAsian<Real>);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not get function attributes: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    if (block.x > (unsigned int)funcAttributes.maxThreadsPerBlock)
+    {
+        throw std::runtime_error("Block X dimension is too large for computeValueAsian kernel");
+    }
+
+    // Get computeValuePlainVanilla function properties and check the maximum block size
+    cudaResult = cudaFuncGetAttributes(&funcAttributes, computeValuePlainVanilla<Real>);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not get function attributes: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    if (block.x > (unsigned int)funcAttributes.maxThreadsPerBlock)
+    {
+        throw std::runtime_error("Block X dimension is too large for computeValuePlainVanilla kernel");
+    }
+
+    // Get computeValueKnockoutin function properties and check the maximum block size
+    cudaResult = cudaFuncGetAttributes(&funcAttributes, computeValueKnockoutin<Real>);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not get function attributes: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    if (block.x > (unsigned int)funcAttributes.maxThreadsPerBlock)
+    {
+        throw std::runtime_error("Block X dimension is too large for computeValueKnockoutin kernel");
+    }
+
+    //Get computeValueLookback functionproperties and check the maximum block size
+    cudaResult = cudaFuncGetAttributes(&funcAttributes, computeValueLookback<Real>);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not get function attributes: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    if (block.x > (unsigned int)funcAttributes.maxThreadsPerBlock)
+    {
+        throw std::runtime_error("Block X dimension is too large for computeValueLookback kernel");
+    }
+
+    // Setup problem on GPU
+    genericOption<Real> *d_option = 0;
+    cudaResult = cudaMalloc((void **)&d_option, sizeof(genericOption<Real>));
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not allocate memory on device for option data: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    cudaResult = cudaMemcpy(d_option, &option, sizeof(genericOption<Real>), cudaMemcpyHostToDevice);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not copy data to device: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+
+    // Allocate memory for paths
+    Real *d_paths  = 0;
+    int numTimesteps = static_cast<int>(option.tenor / option.dt);
+    cudaResult = cudaMalloc((void **)&d_paths, m_numSims * numTimesteps * sizeof(Real));
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not allocate memory on device for paths: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+
+    // Allocate memory for RNG states
+    curandState *d_rngStates = 0;
+    cudaResult = cudaMalloc((void **)&d_rngStates, grid.x * block.x * sizeof(curandState));
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not allocate memory on device for RNG state: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+
+    // Allocate memory for result
+    Real *d_values = 0;
+    cudaResult = cudaMalloc((void **)&d_values, grid.x * sizeof(Real));
+    if (cudaResult != cudaSuccess){
+        string msg("Could not allocate memory on device for partial results: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+
+    double elapsedTime2;
+    shrDeltaT(2);
+
+    // Initialise RNG
+    initRNG<<<grid, block>>>(d_rngStates, m_seed);
+
+    // Generate paths
+    generatePaths<Real><<<grid, block>>>(d_paths, d_rngStates, d_option, m_numSims, numTimesteps);
+        
+    vector<Real> values(grid.x);
+///////////////////////////////////////////////////////////////////
+    // Compute values Plain Vanilla Option
+
+    computeValuePlainVanilla<<<grid, block, block.x * sizeof(Real)>>>(d_values, d_paths, d_option, m_numSims, numTimesteps);
+    // Copy partial results back
+    cudaResult = cudaMemcpy(&values[0], d_values, grid.x * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (cudaResult != cudaSuccess){
+        string msg("Could not copy partial results to host: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    // Complete sum-reduction on host
+    option.valuePlainVanilla = std::accumulate(values.begin(), values.end(), static_cast<Real>(0));
+    // Compute the mean
+    option.valuePlainVanilla /= m_numSims; 
+    // Discount to present value
+    option.valuePlainVanilla *= exp(- option.r * option.tenor);
+    elapsedTime2 = shrDeltaT(2);
+    printf("\n Time Spent working on Plain Vanilla option in the GPU is: %f\n\n", elapsedTime2);
+/////////////////////////////////////////////////////////////////////
+    // Compute values Asian Option
+    computeValueAsian<<<grid, block, block.x * sizeof(Real)>>>(d_values, d_paths, d_option, m_numSims, numTimesteps);
+    // Copy partial results back
+    cudaResult = cudaMemcpy(&values[0], d_values, grid.x * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not copy partial results to host: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    // Complete sum-reduction on host
+    option.valueAsian = std::accumulate(values.begin(), values.end(), static_cast<Real>(0));
+    // Compute the mean
+    option.valueAsian /= m_numSims;
+    // Discount to present value
+    option.valueAsian *= exp(- option.r * option.tenor);
+///////////////////////////////////////////////////////////////////
+    // Compute values Knockout and knockin Option
+    // Allocate memory for knockin result
+    Real *d_values2 = 0;
+    cudaResult = cudaMalloc((void **)&d_values2, grid.x * sizeof(Real));
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not allocate memory on device for partial results: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    computeValueKnockoutin<<<grid, block, block.x * sizeof(Real)>>>(d_values, d_values2, d_paths, d_option, m_numSims, numTimesteps);
+    // Copy partial results back
+    cudaResult = cudaMemcpy(&values[0], d_values, grid.x * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not copy partial results to host: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    // Complete sum-reduction on host
+    option.valueKnockout = std::accumulate(values.begin(), values.end(), static_cast<Real>(0));
+    // Compute the mean
+    option.valueKnockout /= m_numSims;
+    // Discount to present value
+    option.valueKnockout *= exp(- option.r * option.tenor);
+
+    cudaResult = cudaMemcpy(&values[0], d_values2, grid.x * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (cudaResult != cudaSuccess)
+    {
+        string msg("Could not copy partial results to host: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    // Complete sum-reduction on host
+    option.valueKnockin = std::accumulate(values.begin(), values.end(), static_cast<Real>(0));
+    // Compute the mean
+    option.valueKnockin /= m_numSims;
+    // Discount to present value
+    option.valueKnockin *= exp(- option.r * option.tenor);
+///////////////////////////////////////////////////////////////////
+    // Compute values Lookback Option
+
+    computeValueLookback<<<grid, block, block.x * sizeof(Real)>>>(d_values, d_paths, d_option, m_numSims, numTimesteps);
+    // Copy partial results back
+    cudaResult = cudaMemcpy(&values[0], d_values, grid.x * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (cudaResult != cudaSuccess){
+        string msg("Could not copy partial results to host: ");
+        msg += cudaGetErrorString(cudaResult);
+        throw std::runtime_error(msg);
+    }
+    // Complete sum-reduction on host
+    option.valueLookback = std::accumulate(values.begin(), values.end(), static_cast<Real>(0));
+    // Compute the mean
+    option.valueLookback /= m_numSims; 
+    // Discount to present value
+    option.valueLookback *= exp(- option.r * option.tenor);
+///////////////////////////////////////////////////////////////////
+    // Cleanup
+    if (d_option)
+    {
+        cudaFree(d_option);
+        d_option = 0;
+    }
+    if (d_paths)
+    {
+        cudaFree(d_paths);
+        d_paths = 0;
+    }
+    if (d_rngStates)
+    {
+        cudaFree(d_rngStates);
+        d_rngStates = 0;
+    }
+    if (d_values)
+    {
+        cudaFree(d_values);
+        d_values = 0;
+    }
+    if(d_values2){
+      cudaFree(d_values2);
+      d_values2 = 0;
+    }
+}
+
+template <typename Real>
+Real box_muller(Real m, Real s)	/* normal random variate generator */
+{				        /* mean m, standard deviation s */
+	Real x1, x2, w, y1;
+	static Real y2;
+	static int use_last = 0;
+
+	if (use_last){		        /* use value from previous call */
+		y1 = y2;
+		use_last = 0;
+	}
+	else{
+		do {
+			x1 = 2.0 * (Real)rand()/ (Real)RAND_MAX - 1.0;
+			x2 = 2.0 * (Real)rand()/ (Real)RAND_MAX - 1.0;
+			//printf("random values: %f, %f \n", x1, x2);
+			w = x1 * x1 + x2 * x2;
+		} while ( w >= 1.0 );
+
+		w = sqrt( (-2.0 * log( w ) ) / w );
+		y1 = x1 * w;
+		y2 = x2 * w;
+		use_last = 1;
+	}
+	return( m + y1 * s );
+}
+
+
+template <typename Real>
+void PricingEngine<Real>::operator[](genericOption<Real> &option){
+  
+  const Real S = option.spot;
+  const Real X = option.strike;
+  const Real T = option.tenor;
+  const Real R = option.r;
+  const Real V = option.sigma;
+  const Real N = m_numSims;
+  const int numtimeSteps =  static_cast<int>(option.tenor / option.dt);
+  const Real MuBydT = (R - 0.5 * V * V) * option.dt;
+  const Real VBySqrtdT = V * sqrt(option.dt);
+
+  Real rn, St = S, sumVanilla = 0, valOp = 0;
+  int pos;
+
+  for (int thisone = 0 ; thisone < N ; thisone++){
+    St = S;
+    for (pos = 0; pos < numtimeSteps; pos++){
+      rn = box_muller<Real>(static_cast<Real>(0.0), static_cast<Real>(1.0));
+      St *= static_cast<Real> (exp (MuBydT + VBySqrtdT * rn));
+    }
+    valOp = (St > X) ? St - X: 0;
+    sumVanilla += valOp;
+  }
+
+  option.valuePlainVanillaCPU = static_cast<Real>(exp (-R * T) * sumVanilla / N);
+
+}
+
+// Explicit template instantiation
+template class PricingEngine<float>;
+template class PricingEngine<double>;

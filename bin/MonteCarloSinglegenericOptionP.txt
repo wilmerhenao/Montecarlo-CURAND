@@ -1,0 +1,14 @@
+Monte Carlo Path - Dependent Options with cuRand
+===========================================
+
+Pricing option on GPU (GeForce GTX 550 Ti)
+
+Time Spent working on PlainVanilla on the CPU: 0.829501
+Precision:      double
+Number of simulations: 100000
+
+Spot|Strike|  r   |sigma|   tenor  |  Call/Put  | AsianValue |AsiaExpected|PlainVanilla|   PVCPU    | Knock-Out  |  Knock-In  | K-Out+K-In | Lookback |AsianLkBkK-O|
+----|------|------|-----|----------|------------|------------|------------|------------|------------|------------|------------|------------|----------|------------|
+ 40 |   35 | 0.03 | 0.2 | 0.333333 |       Call |    5.16642 |    5.16253 |    5.57411 |    5.57116 |    2.56092 |    3.01319 |    5.57411 |    3.49285 |  2.05178 | 
+Total Time Spent on  GPU :6.94167e-310
+
