@@ -1,1 +1,1 @@
-This project illustrates the pricing of asian options using CUDA and its random number generation library CURAND
+This project illustrates the pricing of asian options using CUDA and its random number generation library CURAND. Testing the usefulness of CURAND to generate random numbers and using that to price asian, knock-in, knock-out, golden, ALK and plain-vanilla options
